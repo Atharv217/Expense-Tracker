@@ -1,0 +1,336 @@
+from datetime import date, timedelta
+import sys
+import os
+import subprocess
+import argparse
+import json
+from collections import defaultdict
+from mercurial import ui, hg, commands, error
+from random import random
+
+VERSION="0.1"
+
+HOME = os.getenv("HOME")
+EXPENSES_DIR = os.path.join(HOME, ".expenses")
+REPO_DIR = os.path.join(EXPENSES_DIR, 'repo')
+EXPENSES_FILE=os.path.join(REPO_DIR, "expenses.csv")
+CAT_FILE = os.path.join(EXPENSES_DIR, 'cats.json')
+
+EDITOR=os.getenv("EDITOR")
+if not EDITOR:
+    EDITOR = "vim"
+
+colours = [
+        "#89C7A9",
+        "#E4CF2E",
+        "#574F17",
+        "#639255"
+]
+
+cmds = {}
+usages = {}
+
+def cli(cmd, usage):
+    """ Decorator for exposing a function to the command-line-interface.
+    >>> @cli('add', 'add AMOUNT COMMENT')
+    ... def add_fn(args):
+    ...    pass
+    >>> 'add' in cmds
+    True
+    >>> 'add' in usages:
+    True
+    """
+    def deco(f):
+        cmds[cmd] = f
+        usages[cmd] = usage
+        return f
+    return deco
+
+def commitafter(msg):
+    """ Decorator for a function that modifies the expenses file. This
+    causes it to commit a change to the repository if the function returns
+    True, or to revert the change if it returns False """
+    def deco(f):
+        def _inner(*args, **kwargs):
+            if f(*args, **kwargs):
+                print ("Committing change")
+                try:
+                    commands.commit(ui.ui(), repo, message=msg)
+                except error.Abort as e :
+                    print ("Warning mercurial returned the following error: \"%s\"") % e
+                return True
+            else:
+                print ("Reverting change")
+                commands.update(ui.ui(), repo, "tip", clean=True)
+                return False
+        return _inner
+    return deco
+
+
+def print_usage():
+    usage_strings = ["{0} {1}".format(sys.argv[0], usage) for k, usage in usages.iteritems()]
+    print (
+    "USAGE: {0}").format(usage_strings[0])
+    print ("\n").join(["       {0}".format(s) for s in usage_strings[1:]])
+
+class Entry(object):
+    def __init__(self, entry_date=None, amount=None, message=None, string=None):
+        if entry_date and string:
+            raise ValueError("Cannot specify both a date and a string")
+        if not entry_date and string:
+            d, amt, msg = string.split(',')
+            self.date = date(*[int(n) for n in d.split("-")])
+            self.amount = float(amt)
+            self.message = msg.strip()
+        else:
+            self.date = entry_date
+            self.amount = amount
+            self.message = message
+
+    def cats(self, all_cats):
+        """ What categories does this Entry fall under?"""
+        r = [cat for cat,words in all_cats if any(word.lower() in self.message.lower() for word in words)]
+        if len(r)>1:
+            print ("Entry \"{0}\" on date {1} falls under the following categories: {2}").format(self.message, self.date, r)
+        if len(r) == 0:
+            print ("No cats for {0}").format(self.message)
+        return r
+
+    def __str__(self):
+        return "{0}, {1:.2f}, {2}".format(self.date.isoformat(), self.amount, self.message)
+        
+def parse_entries(f, fromdate=None, todate=None):
+    try:
+        entries = [Entry(string=line) for i, line in enumerate(f) if line.lstrip()[0] != "#"]
+        if fromdate:
+            entries = [e for e in entries if e.date >= fromdate]
+        if todate:
+            entries = [e for e in entries if e.date <= todate]
+        return entries
+    except ValueError:
+        print ("Invalid expenses file, line:{0}").format(i+1)
+        print ("line"
+            )
+        return None
+
+def parse_cats(f):
+    return json.load(f)
+
+def parse_date(s):
+    if s.lower() == "today":
+        return date.today()
+    if s.lower() == "yesterday":
+        return date.today()-timedelta(1)
+    # Parses a date in ISO format to a datetime
+    try:
+        return date(*(int(n) for n in s.split('-')))
+    except ValueError:
+        raise ValueError("String {0} not a valid ISO date".format(s))
+        
+#################################################
+#  Command-line-interface function definitions  #
+#################################################
+@cli('add', 'add AMOUNT COMMENT')
+@commitafter("Added expense")
+def add(argv):
+    parser = argparse.ArgumentParser(prog="{0} plot".format(sys.argv[0]))
+    parser.add_argument('amount', type=float, help='The amount of the expense (e.g. 3.75)')
+    parser.add_argument('message', help="The message to associate with the expense. \
+You should likely use a list of tags for ease of processing later.")
+    parser.add_argument('--date', type=parse_date, help="The date on which the expense occured (YYYY-MM-DD)")
+
+    args = parser.parse_args(argv)
+    if args.date:
+        entry = Entry(args.date, args.amount, args.message)
+    else:
+        entry = Entry(date.today(), args.amount, args.message)
+    with open(EXPENSES_FILE, 'a') as f:
+        f.write(str(entry))
+        f.write("\n")
+    return True
+
+@cli('list', 'list')
+def cli_list(argv):
+    parser = argparse.ArgumentParser(prog="{0} plot".format(sys.argv[0]))
+    parser.add_argument('--fromdate', type=parse_date)
+    parser.add_argument('--todate', type=parse_date)
+    args = parser.parse_args(argv)
+    entries = parse_entries(open(EXPENSES_FILE), fromdate=args.fromdate, todate=args.todate)
+    for entry in sorted(entries, key=str):
+        print (entry)
+    return True
+
+@cli('edit', 'edit')
+@commitafter("Manually edited file")
+def edit(args):
+    rc = subprocess.call([EDITOR, EXPENSES_FILE])
+    if rc != 0:
+        print ("Editing file failed")
+        return False
+    if parse_entries(open(EXPENSES_FILE)) is None:
+        return False
+    return True
+
+@cli('cats', 'cats')
+def cli_cats(args):
+    rc = subprocess.call([EDITOR, CAT_FILE])
+    if rc != 0:
+        print ("Editing cat file failed")
+        return False
+    else:
+        return True
+
+@cli('summary', 'summary')
+def summary(argv):
+    parser = argparse.ArgumentParser(prog="{0} plot".format(sys.argv[0]))
+    parser.add_argument('--fromdate', type=parse_date)
+    parser.add_argument('--todate', type=parse_date)
+    args = parser.parse_args(argv)
+
+    entries = parse_entries(open(EXPENSES_FILE), fromdate=args.fromdate, todate=args.todate)
+    if entries is None:
+        return False
+    if len(entries) == 0:
+        print ("No data to summarize!")
+        return True
+
+    from_date = args.fromdate if args.fromdate else min(entry.date for entry in entries)
+    to_date = args.todate if args.todate else max(entry.date for entry in entries)
+
+    total_spent = sum(entry.amount for entry in entries)
+    mean_all = total_spent/((to_date-from_date).days + 1)
+    spentdays = set(entry.date for entry in entries)
+    # Average over days where some money was spent
+    mean_some = total_spent/len(spentdays)
+
+    days = [sum(entry.amount for entry in entries if entry.date == from_date+timedelta(d))
+            for d in range((to_date-from_date).days+1)]
+    days.sort()
+    if len(days)%2 == 0:
+        median = (days[len(days)//2-1]+days[len(days)//2])/2
+    else:
+        median = days[len(days)//2]
+    print ("Report from {0} to {1}").format(from_date, to_date)
+    print ("Total spent: ${0:.2f}").format(total_spent)
+    print ("Mean per day: ${0:.2f}(*30 = ${1:.2f})").format(mean_all, mean_all*30)
+    print ("Median per day: ${0:.2f}").format(median)
+    print ("Mean per day on days with non-zero spending: ${0:.2f} (*30 = ${1:.2f})").format(mean_some, mean_some*30)
+    return True
+    
+
+@cli('plot', 'plot')
+def plot(argv):
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    
+    parser = argparse.ArgumentParser(prog="{0} plot".format(sys.argv[0]))
+    parser.add_argument('--fromdate', type=parse_date)
+    parser.add_argument('--todate', type=parse_date)
+    parser.add_argument('--max',
+        help="The y-axis of the plot is amount spent, this scales the graph to only show up to AMOUNT.",
+        metavar="AMOUNT", type=float)
+
+    args = parser.parse_args(argv)
+
+    dayLocator = mdates.DayLocator()
+    formatter = mdates.DateFormatter('%Y-%m-%d')
+    dates = defaultdict(float)
+    entries = parse_entries(open(EXPENSES_FILE), fromdate=args.fromdate, todate=args.todate)
+    fromdate = args.from_date if args.fromdate is not None else min(e.date for e in entries)
+    todate = args.to_date if args.todate is not None else max(e.date for e in entries)
+        
+    if entries is None:
+        return False
+    if len(entries) == 0:
+        print ("No entries to plot!")
+        return True
+
+    all_cats=parse_cats(open(CAT_FILE))
+    cat_entries = defaultdict(list)
+    for entry in entries:
+        cats = entry.cats(all_cats)
+        if len(cats)==0:
+            cat_entries["other"].append(entry)
+        else:
+            cat_entries[cats[0]].append(entry)
+        dates[entry.date] += entry.amount
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    if args.max:
+        ax.set_ylim(0,args.max)
+
+    ax.xaxis.set_major_locator(dayLocator)
+    ax.xaxis.set_major_formatter(formatter)
+    dates = list(sorted(fromdate+timedelta(i) for i in range((todate-fromdate).days+1)))
+
+    prevheights=[0]*len(dates)
+    bars = {}
+    sorted_cats = sorted(cat_entries.items(), key=lambda x:sum(e.amount for e in x[1]), reverse=True)
+    for i, c in enumerate(sorted_cats):
+        k,v = c
+        heights = [sum(e.amount for e in v if e.date == date) for date in dates]
+        bars[k] = ax.bar(dates, heights, bottom=prevheights,
+                color=colours[i] if i < len(colours) else (random(), random(), random()),
+                linewidth=0)
+        prevheights = [sum(e) for e in zip(heights, prevheights)]
+    sorted_bars = sorted(bars.items(), key=lambda x:sum(e.amount for e in cat_entries[x[0]]))
+    
+    fig.legend(*zip(*[(bar[0], cat) for cat, bar in bars.items()]))
+
+    #ax.bar([k for k in sorted(dates.keys())],
+        #[dates[k] for k in sorted(dates.keys())],
+        #color="#809860")
+    fig.autofmt_xdate()
+    
+    plt.show()
+    return True
+    #plt.plot((date(*k.split("-")) for k in sorted(dates.keys())),
+
+######################################################################
+# Initialization stuff                                               #
+######################################################################
+def init_dir():
+    """Initialize the .expenses directory, and the mercurial repository"""
+    try:
+        os.mkdir(EXPENSES_DIR)
+        os.mkdir(REPO_DIR)
+    except OSError e:
+        print e
+        return False
+    with open(EXPENSES_FILE, 'w') as f:
+        f.write("# Version: {0}\n".format(VERSION))
+    repo = hg.repository(ui.ui(), REPO_DIR, create=True)
+    try:
+        commands.commit(ui.ui(), repo, EXPENSES_FILE, message="Initialized new expenses file", addremove=True)
+    except error.Abort as (e):
+        print "Warning mercurial returned the following error: \"%s\"" % e
+
+    return True
+
+def load_repo():
+    """ Load the mercurial repository into the global repo variable """
+    global repo
+    repo = hg.repository(ui.ui(), REPO_DIR)
+
+def main():
+    # If the .expenses folder does not exist, create it.
+    if not os.path.isdir(EXPENSES_DIR):
+        if not init_dir(): return 1
+
+    load_repo()
+
+    if len(sys.argv) == 1:
+        print_usage()
+        return 1
+    fn = cmds.get(sys.argv[1])
+    if fn == None:
+        print_usage()
+        return 1
+    if not fn(sys.argv[2:]):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
